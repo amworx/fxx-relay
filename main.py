@@ -18,9 +18,9 @@ import wire
 from api import App, serve
 from store import Store
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+BASE_DIR = os.environ.get("HOSTLESS_APP_DIR", "/app")
+DATA_DIR = "/tmp"
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
 DEFAULTS = {
     "host": "127.0.0.1",

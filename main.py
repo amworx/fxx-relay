@@ -99,11 +99,13 @@ def announce_address(config: dict, data_dir: str) -> None:
 
 
 def main() -> None:
-    # Hostless has ephemeral /app; use /tmp for the DB.
-    data_dir = DATA_DIR if not os.environ.get("HOSTLESS") else "/tmp"
+    # Container hosts (Hostless, Fly.io) mount /app read-only; use /tmp for state.
+    data_dir = DATA_DIR
+    if not os.access(os.path.dirname(DATA_DIR), os.W_OK):
+        data_dir = "/tmp"
     os.makedirs(data_dir, exist_ok=True)
     config = load_config()
-    # Force port from env (Hostless overrides PORT).
+    # Hostless injects PORT; respect it, but fall back to config for local runs.
     port = int(os.environ.get("PORT", config["port"]))
     config["port"] = port
     store = Store(os.path.join(data_dir, "fxx.db"))

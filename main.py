@@ -99,9 +99,14 @@ def announce_address(config: dict, data_dir: str) -> None:
 
 
 def main() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    # Hostless has ephemeral /app; use /tmp for the DB.
+    data_dir = DATA_DIR if not os.environ.get("HOSTLESS") else "/tmp"
+    os.makedirs(data_dir, exist_ok=True)
     config = load_config()
-    store = Store(os.path.join(DATA_DIR, "fxx.db"))
+    # Force port from env (Hostless overrides PORT).
+    port = int(os.environ.get("PORT", config["port"]))
+    config["port"] = port
+    store = Store(os.path.join(data_dir, "fxx.db"))
     app = App(store, config, DATA_DIR)
 
     announce_address(config, DATA_DIR)

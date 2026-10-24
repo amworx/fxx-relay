@@ -111,7 +111,9 @@ def main() -> None:
 
     announce_address(config, DATA_DIR)
 
-    serve(app, config["host"], int(config["port"]))
+    # Hostless requires binding to 0.0.0.0; fall back to config host for local.
+    host = "0.0.0.0" if os.environ.get("HOSTLESS") else config["host"]
+    serve(app, host, int(config["port"]))
     print(
         f"fxx relay listening on {config['host']}:{config['port']} "
         f"symbol={config['symbol']} tick={config['tick_seconds']}s "

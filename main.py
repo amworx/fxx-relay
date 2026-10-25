@@ -18,9 +18,25 @@ import wire
 from api import App, serve
 from store import Store
 
-BASE_DIR = os.environ.get("HOSTLESS_APP_DIR", "/app")
-DATA_DIR = "/tmp"
-CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _state_dir() -> str:
+    """Where config and a local database may be written.
+
+    The phone relay owns its directory; a container host mounts the image
+    read-only and wipes /tmp between deploys, which is why production there
+    keeps its records in Postgres and only the config is local.
+    """
+    if os.access(BASE_DIR, os.W_OK):
+        return BASE_DIR
+    return "/tmp"
+
+
+STATE_DIR = _state_dir()
+DATA_DIR = os.path.join(STATE_DIR, "data")
+CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 DEFAULTS = {
     "host": "127.0.0.1",
@@ -99,25 +115,20 @@ def announce_address(config: dict, data_dir: str) -> None:
 
 
 def main() -> None:
-    # Container hosts (Hostless, Fly.io) mount /app read-only; use /tmp for state.
-    data_dir = DATA_DIR
-    if not os.access(os.path.dirname(DATA_DIR), os.W_OK):
-        data_dir = "/tmp"
-    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     config = load_config()
     # Hostless injects PORT; respect it, but fall back to config for local runs.
-    port = int(os.environ.get("PORT", config["port"]))
-    config["port"] = port
-    store = Store(os.path.join(data_dir, "fxx.db"))
+    config["port"] = int(os.environ.get("PORT", config["port"]))
+    store = Store(DATABASE_URL or os.path.join(DATA_DIR, "fxx.db"))
     app = App(store, config, DATA_DIR)
 
     announce_address(config, DATA_DIR)
 
-    # Hostless requires binding to 0.0.0.0; fall back to config host for local.
-    host = "0.0.0.0" if os.environ.get("HOSTLESS") else config["host"]
+    # A container host publishes one fixed address; bind where it can reach us.
+    host = "0.0.0.0" if DATABASE_URL or not os.access(BASE_DIR, os.W_OK) else config["host"]
     serve(app, host, int(config["port"]))
     print(
-        f"fxx relay listening on {config['host']}:{config['port']} "
+        f"fxx relay listening on {host}:{config['port']} "
         f"symbol={config['symbol']} tick={config['tick_seconds']}s "
         f"tenants={store.tenant_count()} "
         f"linking={'on' if config.get('google_client_id') else 'off'}",

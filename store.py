@@ -1,4 +1,9 @@
-"""SQLite persistence: tenants, the sync store, the evaluation cursor, alert memory.
+"""Persistence: tenants, the sync store, the evaluation cursor, alert memory.
+
+Two dialects, one code path. A local path gives SQLite (tests, the phone relay);
+a `postgres://` URL gives Postgres (the cloud relay, where the container
+filesystem is wiped on every deploy). The SQL is written once and the wrapper
+rewrites placeholders, so a statement cannot drift between the two.
 
 One connection, one lock. The workload is a handful of statements per minute, so
 serialising access costs nothing and removes a whole class of races between the
@@ -8,10 +13,14 @@ HTTP thread and the evaluator thread.
 methods on purpose: a call site that forgets the tenant is a compile-time error
 in a typed language and a silent cross-user leak in this one, so the signature
 forces the decision at every call.
+
+Millisecond columns are BIGINT everywhere: epoch milliseconds overflow a 32-bit
+integer, which SQLite would silently accept and Postgres would reject.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -25,7 +34,7 @@ BUCKETS = ("alerts", "fires", "journal", "settings", "profile")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
   id         TEXT PRIMARY KEY,
-  created    INTEGER NOT NULL,
+  created    BIGINT NOT NULL,
   google_sub TEXT UNIQUE,
   email      TEXT,
   label      TEXT
@@ -34,7 +43,7 @@ CREATE TABLE IF NOT EXISTS tenants (
 CREATE TABLE IF NOT EXISTS tenant_keys (
   key_hash TEXT PRIMARY KEY,
   tenant   TEXT NOT NULL,
-  created  INTEGER NOT NULL,
+  created  BIGINT NOT NULL,
   label    TEXT
 );
 CREATE INDEX IF NOT EXISTS tenant_keys_tenant ON tenant_keys (tenant);
@@ -43,7 +52,7 @@ CREATE TABLE IF NOT EXISTS kv_sync (
   tenant     TEXT    NOT NULL,
   bucket     TEXT    NOT NULL,
   id         TEXT    NOT NULL,
-  updated_at INTEGER NOT NULL,
+  updated_at BIGINT  NOT NULL,
   device     TEXT    NOT NULL,
   deleted    INTEGER NOT NULL,
   body       TEXT    NOT NULL,
@@ -53,16 +62,16 @@ CREATE INDEX IF NOT EXISTS kv_sync_pull ON kv_sync (tenant, bucket, updated_at);
 
 CREATE TABLE IF NOT EXISTS cursors (
   interval TEXT PRIMARY KEY,
-  bar_ms   INTEGER NOT NULL
+  bar_ms   BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS server_alerts (
-  tenant         TEXT    NOT NULL,
-  id             TEXT    NOT NULL,
+  tenant         TEXT   NOT NULL,
+  id             TEXT   NOT NULL,
   armed          INTEGER NOT NULL,
-  watching_since INTEGER NOT NULL,
-  last_fired_ms  INTEGER,
-  last_bar_ms    INTEGER,
+  watching_since BIGINT NOT NULL,
+  last_fired_ms  BIGINT,
+  last_bar_ms    BIGINT,
   PRIMARY KEY (tenant, id)
 );
 
@@ -86,16 +95,116 @@ def _new_tenant_id() -> str:
     return "t_" + secrets.token_hex(8)
 
 
-class Store:
-    def __init__(self, path: str) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self.path = path
-        self._lock = threading.RLock()
-        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+def _is_dsn(target: str) -> bool:
+    return target.startswith(("postgres://", "postgresql://"))
+
+
+def _is_disconnect(error: Exception) -> bool:
+    """A dropped cloud connection, as opposed to a bad statement."""
+    return type(error).__name__ in ("OperationalError", "InterfaceError")
+
+
+class _Cursor:
+    """The slice of the cursor API the store uses, over a psycopg cursor."""
+
+    def __init__(self, cursor) -> None:
+        self._cursor = cursor
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+
+class _Db:
+    """One connection, dialect-normalised.
+
+    Rows come back as mappings in both dialects (`sqlite3.Row` and `dict_row`
+    both answer `row["name"]` and `dict(row)`), so call sites need no branch.
+    A lost Postgres connection is reopened once before the statement is retried,
+    because the relay is expected to outlive a database restart.
+    """
+
+    def __init__(self, target: str) -> None:
+        self.is_pg = _is_dsn(target)
+        self.target = target
+        self._db = None
+        self._connect()
+
+    def _connect(self) -> None:
+        if self.is_pg:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            self._db = psycopg.connect(
+                self.target, autocommit=True, row_factory=dict_row
+            )
+            return
+        os.makedirs(os.path.dirname(self.target) or ".", exist_ok=True)
+        self._db = sqlite3.connect(
+            self.target, check_same_thread=False, isolation_level=None
+        )
         self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+
+    def _sql(self, sql: str) -> str:
+        return sql.replace("?", "%s") if self.is_pg else sql
+
+    def execute(self, sql: str, params=()):
+        try:
+            return self._run(sql, params)
+        except Exception as error:
+            if not self.is_pg or not _is_disconnect(error):
+                raise
+            self._connect()
+            return self._run(sql, params)
+
+    def _run(self, sql: str, params):
+        text = self._sql(sql)
+        if self.is_pg:
+            cursor = self._db.cursor()
+            cursor.execute(text, params)
+            return _Cursor(cursor)
+        return self._db.execute(text, params)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    @contextlib.contextmanager
+    def tx(self):
+        """A transaction in whichever dialect, so a rollback never leaks."""
+        if self.is_pg:
+            with self._db.transaction():
+                yield
+            return
+        self._db.execute("BEGIN")
+        try:
+            yield
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def close(self) -> None:
+        self._db.close()
+
+
+class Store:
+    def __init__(self, target: str) -> None:
+        """`target` is a SQLite path or a Postgres DSN."""
+        self.target = target
+        self.path = "" if _is_dsn(target) else target
+        self._lock = threading.RLock()
+        self._db = _Db(target)
         with self._lock:
-            self._db.execute("PRAGMA journal_mode=WAL")
-            self._db.execute("PRAGMA synchronous=NORMAL")
             self._migrate_legacy()
             self._db.executescript(SCHEMA)
 
@@ -106,6 +215,13 @@ class Store:
     # ------------------------------------------------------------- migration
 
     def _columns(self, table: str) -> set[str]:
+        if self._db.is_pg:
+            rows = self._db.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name=? AND table_schema=current_schema()",
+                (table,),
+            ).fetchall()
+            return {row["column_name"] for row in rows}
         rows = self._db.execute(f"PRAGMA table_info({table})").fetchall()
         return {row["name"] for row in rows}
 
@@ -116,11 +232,22 @@ class Store:
         device's history changes - it simply becomes one tenant among many.
         Each table is checked on its own, because a database can be left
         half-migrated by a cut that rebuilt only one of them.
+
+        Postgres never carries a pre-v33 database: the cloud relay starts empty.
         """
+        if self._db.is_pg:
+            return
         self._migrate_kv_sync()
         self._migrate_server_alerts()
 
     def _table_exists(self, table: str) -> bool:
+        if self._db.is_pg:
+            row = self._db.execute(
+                "SELECT 1 FROM information_schema.tables"
+                " WHERE table_name=? AND table_schema=current_schema()",
+                (table,),
+            ).fetchone()
+            return row is not None
         return bool(
             self._db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -130,12 +257,11 @@ class Store:
     def _migrate_kv_sync(self) -> None:
         if not self._table_exists("kv_sync") or "tenant" in self._columns("kv_sync"):
             return
-        self._db.execute("BEGIN")
-        try:
+        with self._db.tx():
             self._db.execute(
                 "CREATE TABLE kv_sync_v33 ("
                 " tenant TEXT NOT NULL, bucket TEXT NOT NULL, id TEXT NOT NULL,"
-                " updated_at INTEGER NOT NULL, device TEXT NOT NULL,"
+                " updated_at BIGINT NOT NULL, device TEXT NOT NULL,"
                 " deleted INTEGER NOT NULL, body TEXT NOT NULL,"
                 " PRIMARY KEY (tenant, bucket, id))"
             )
@@ -145,10 +271,6 @@ class Store:
             )
             self._db.execute("DROP TABLE kv_sync")
             self._db.execute("ALTER TABLE kv_sync_v33 RENAME TO kv_sync")
-            self._db.execute("COMMIT")
-        except Exception:
-            self._db.execute("ROLLBACK")
-            raise
         print("migrated kv_sync to per-tenant rows (tenant 'main')", flush=True)
 
     def _migrate_server_alerts(self) -> None:
@@ -156,13 +278,12 @@ class Store:
             "server_alerts"
         ):
             return
-        self._db.execute("BEGIN")
-        try:
+        with self._db.tx():
             self._db.execute(
                 "CREATE TABLE server_alerts_v33 ("
                 " tenant TEXT NOT NULL, id TEXT NOT NULL, armed INTEGER NOT NULL,"
-                " watching_since INTEGER NOT NULL, last_fired_ms INTEGER,"
-                " last_bar_ms INTEGER, PRIMARY KEY (tenant, id))"
+                " watching_since BIGINT NOT NULL, last_fired_ms BIGINT,"
+                " last_bar_ms BIGINT, PRIMARY KEY (tenant, id))"
             )
             self._db.execute(
                 "INSERT INTO server_alerts_v33"
@@ -172,10 +293,6 @@ class Store:
             )
             self._db.execute("DROP TABLE server_alerts")
             self._db.execute("ALTER TABLE server_alerts_v33 RENAME TO server_alerts")
-            self._db.execute("COMMIT")
-        except Exception:
-            self._db.execute("ROLLBACK")
-            raise
         print("migrated server_alerts to per-tenant rows (tenant 'main')", flush=True)
 
     # --------------------------------------------------------------- tenants
@@ -303,8 +420,7 @@ class Store:
                 "SELECT bucket, id, updated_at, device, deleted, body FROM kv_sync WHERE tenant=?",
                 (src,),
             ).fetchall()
-            self._db.execute("BEGIN")
-            try:
+            with self._db.tx():
                 for row in rows:
                     record = json.loads(row["body"])
                     record["id"] = row["id"]
@@ -312,10 +428,6 @@ class Store:
                     record["_d"] = bool(row["deleted"])
                     if self.put(dst, row["bucket"], record, row["device"]):
                         moved += 1
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
         return moved
 
     # ---------------------------------------------------------------- sync
@@ -408,8 +520,7 @@ class Store:
     def apply_push(self, tenant: str, push: dict, device: str) -> int:
         changed = 0
         with self._lock:
-            self._db.execute("BEGIN")
-            try:
+            with self._db.tx():
                 for bucket, records in (push or {}).items():
                     if bucket not in BUCKETS or not isinstance(records, list):
                         continue
@@ -418,10 +529,6 @@ class Store:
                             tenant, bucket, record, device
                         ):
                             changed += 1
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
         return changed
 
     # ------------------------------------------------------------- alerts
@@ -466,11 +573,18 @@ class Store:
             return row["bar_ms"] if row else 0
 
     def set_cursor(self, interval: str, bar_ms: int) -> None:
+        # The max is taken here rather than in SQL: `MAX(a, b)` is a scalar in
+        # SQLite and an aggregate in Postgres, so one expression cannot serve
+        # both. The lock is already held, so the read and write are atomic.
         with self._lock:
+            row = self._db.execute(
+                "SELECT bar_ms FROM cursors WHERE interval=?", (interval,)
+            ).fetchone()
+            value = bar_ms if row is None else max(int(row["bar_ms"]), int(bar_ms))
             self._db.execute(
                 "INSERT INTO cursors (interval, bar_ms) VALUES (?,?)"
-                " ON CONFLICT(interval) DO UPDATE SET bar_ms=MAX(bar_ms, excluded.bar_ms)",
-                (interval, bar_ms),
+                " ON CONFLICT(interval) DO UPDATE SET bar_ms=excluded.bar_ms",
+                (interval, value),
             )
 
     def cursors(self) -> dict[str, int]:
@@ -547,6 +661,12 @@ class Store:
             )
 
     def size_kb(self) -> int:
+        if self._db.is_pg:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT pg_database_size(current_database()) AS n"
+                ).fetchone()
+            return int(row["n"] or 0) // 1024
         total = 0
         for suffix in ("", "-wal", "-shm"):
             try:

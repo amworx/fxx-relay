@@ -147,6 +147,12 @@ class App:
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
                 info = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            # 400/401 from tokeninfo means the token itself is bad: a client
+            # mistake, not a relay fault, so it must not raise /health's alarm.
+            if error.code not in (400, 401):
+                self.note_error(f"google tokeninfo: {error}")
+            return None
         except (urllib.error.URLError, ValueError, OSError) as error:
             self.note_error(f"google tokeninfo: {error}")
             return None

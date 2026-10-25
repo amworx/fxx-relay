@@ -1,4 +1,4 @@
-"""Parity tests for the ported rules and the sync store.
+﻿"""Parity tests for the ported rules and the sync store.
 
 Run from `backend/`:  py -m unittest discover -s tests -v
 """
@@ -634,3 +634,46 @@ class ConfigFromEnvironmentTests(unittest.TestCase):
         config = self.main.load_config()
 
         self.assertNotIn("google_client_id", config)
+
+
+class GoogleTokenRejectionTests(unittest.TestCase):
+    """A bad token is the client's mistake; /health must stay quiet."""
+
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.store = Store(os.path.join(self.dir, "relay.db"))
+        self.app = App(
+            self.store,
+            {"key": "K" * 40, "google_client_id": "1234-abc.apps.googleusercontent.com"},
+            self.dir,
+        )
+
+    def tearDown(self) -> None:
+        self.store.close()
+
+    def _raise(self, error):
+        import urllib.request
+        from unittest import mock
+
+        return mock.patch.object(urllib.request, "urlopen", side_effect=error)
+
+    def test_a_rejected_token_is_not_a_relay_error(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://oauth2.googleapis.com/tokeninfo", 400, "Bad Request", {}, None
+        )
+
+        with self._raise(error):
+            status, body = self.app.link("t_" + "0" * 16, "not-a-real-token")
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"], "invalid google token")
+        self.assertIsNone(self.app.last_error)
+
+    def test_a_network_failure_is_a_relay_error(self) -> None:
+        error = urllib.error.URLError("no route to host")
+
+        with self._raise(error):
+            status, _ = self.app.link("t_" + "0" * 16, "any")
+
+        self.assertEqual(status, 401)
+        self.assertIsNotNone(self.app.last_error)

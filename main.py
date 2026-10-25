@@ -48,6 +48,15 @@ DEFAULTS = {
     "bars_limit": 120,
 }
 
+# Environment name -> config key. The host sets these; the file is a fallback
+# for the phone relay, where an operator edits config.json directly.
+ENV_SETTINGS = (
+    ("GOOGLE_CLIENT_ID", "google_client_id"),
+    ("PUBLIC_URL", "public_url"),
+    ("SYMBOL", "symbol"),
+    ("TICK_SECONDS", "tick_seconds"),
+)
+
 
 def topic_for(key: str) -> str:
     """Deterministic, non-reversible topic name derived from the sync key.
@@ -76,6 +85,14 @@ def load_config() -> dict:
         changed = True
     for name, value in DEFAULTS.items():
         if name not in config:
+            config[name] = value
+            changed = True
+    # Settings the host injects. On a container host config.json is recreated
+    # empty on every deploy, so anything that lives there has to come from the
+    # environment or it is silently absent (Google linking was exactly that).
+    for env_name, name in ENV_SETTINGS:
+        value = os.environ.get(env_name)
+        if value and config.get(name) != value:
             config[name] = value
             changed = True
     config["ntfy_topic"] = topic_for(config["key"])

@@ -586,3 +586,51 @@ class MigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigFromEnvironmentTests(unittest.TestCase):
+    """A container host recreates config.json on every deploy.
+
+    Anything that only lived in that file (Google linking, the symbol) would be
+    silently absent there, which is how `/link` came to answer "not configured"
+    on a relay whose dashboard showed GOOGLE_CLIENT_ID set.
+    """
+
+    def setUp(self) -> None:
+        import main
+
+        self.main = main
+        self._saved_path = main.CONFIG_PATH
+        self._saved_env = {
+            name: os.environ.get(name) for name, _ in main.ENV_SETTINGS
+        }
+        handle, self._path = tempfile.mkstemp(suffix=".json")
+        os.close(handle)
+        os.unlink(self._path)
+        main.CONFIG_PATH = self._path
+        for name, _ in main.ENV_SETTINGS:
+            os.environ.pop(name, None)
+
+    def tearDown(self) -> None:
+        self.main.CONFIG_PATH = self._saved_path
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if os.path.exists(self._path):
+            os.unlink(self._path)
+
+    def test_google_client_id_comes_from_the_environment(self) -> None:
+        os.environ["GOOGLE_CLIENT_ID"] = "1234-abc.apps.googleusercontent.com"
+
+        config = self.main.load_config()
+
+        self.assertEqual(
+            config["google_client_id"], "1234-abc.apps.googleusercontent.com"
+        )
+
+    def test_a_missing_variable_leaves_linking_off(self) -> None:
+        config = self.main.load_config()
+
+        self.assertNotIn("google_client_id", config)

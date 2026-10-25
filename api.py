@@ -111,6 +111,7 @@ class App:
             "journal": counts["journal"],
             "cursors": self.store.cursors(),
             "dbKB": self.store.size_kb(),
+            "db": "postgres" if self.store.is_durable else "sqlite",
             "tenants": self.store.tenant_count(),
             "tunnel": self.tunnel_url(),
             "lastError": self.last_error,

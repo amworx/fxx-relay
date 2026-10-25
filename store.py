@@ -212,6 +212,12 @@ class Store:
         with self._lock:
             self._db.close()
 
+    @property
+    def is_durable(self) -> bool:
+        """True when records outlive the process, which on a container host is
+        the difference between a backup and a scratch file."""
+        return self._db.is_pg
+
     # ------------------------------------------------------------- migration
 
     def _columns(self, table: str) -> set[str]:

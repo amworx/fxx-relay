@@ -436,6 +436,28 @@ class Store:
                         moved += 1
         return moved
 
+    def delete_tenant(self, tenant: str) -> dict[str, int]:
+        """Remove a tenant and every row keyed by it.
+
+        Only the ops route calls this. Nothing else in the relay can drop a row,
+        which is why probe tenants from a durability check were permanent and a
+        lost phone could not be revoked.
+        """
+        removed: dict[str, int] = {}
+        with self._lock:
+            with self._db.tx():
+                for table, column in (
+                    ("kv_sync", "tenant"),
+                    ("tenant_keys", "tenant"),
+                    ("server_alerts", "tenant"),
+                    ("tenants", "id"),
+                ):
+                    cursor = self._db.execute(
+                        f"DELETE FROM {table} WHERE {column}=?", (tenant,)
+                    )
+                    removed[table] = cursor.rowcount
+        return removed
+
     # ---------------------------------------------------------------- sync
 
     def put(self, tenant: str, bucket: str, record: dict, device: str) -> bool:

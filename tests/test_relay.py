@@ -677,3 +677,107 @@ class GoogleTokenRejectionTests(unittest.TestCase):
 
         self.assertEqual(status, 401)
         self.assertIsNotNone(self.app.last_error)
+
+
+class OpsDeleteTests(unittest.TestCase):
+    """The one maintenance door, and the fact that it is not there by default.
+
+    Probe tenants from the durability proof could not be removed and a lost
+    phone could not be revoked, because nothing in the relay could drop a row.
+    """
+
+    KEY = "TESTKEY"
+    OPS = "OPS-SECRET"
+
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp(prefix="fxx-ops-")
+        self.store = Store(os.path.join(self.dir, "t.db"))
+        self.app = App(self.store, {"key": self.KEY}, self.dir)
+        self.server = serve(self.app, "127.0.0.1", 0)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.store.close()
+
+    def seed(self) -> tuple[str, str]:
+        tenant, key = self.store.create_tenant()
+        self.store.put(tenant, "journal", {"id": "j1", "_u": 1000, "pnl": 5}, "phone")
+        self.store.remember_alert(tenant, "a1", True, 1000)
+        return tenant, key
+
+    def post(self, tenant: str, ops_key: str | None) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            self.base + "/ops/tenant/delete",
+            data=json.dumps({"tenant": tenant}).encode("utf-8"),
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/json")
+        if ops_key is not None:
+            request.add_header("X-Ops-Key", ops_key)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8")
+            return error.code, json.loads(raw) if raw else {}
+
+    def test_the_key_comes_from_the_environment(self) -> None:
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"OPS_KEY": self.OPS}):
+            app = App(self.store, {"key": self.KEY}, self.dir)
+
+        self.assertEqual(app.ops_key, self.OPS)
+
+    def test_unset_variable_makes_the_route_absent(self) -> None:
+        tenant, key = self.seed()
+
+        status, body = self.post(tenant, self.OPS)
+
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "not found")
+        self.assertIsNotNone(self.store.tenant_for_key(key))
+        self.assertIsNotNone(self.store.tenant(tenant))
+
+    def test_a_wrong_key_is_refused_and_deletes_nothing(self) -> None:
+        self.app.ops_key = self.OPS
+        tenant, key = self.seed()
+
+        status, body = self.post(tenant, "not-the-key")
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"], "unauthorised")
+        self.assertIsNotNone(self.store.tenant_for_key(key))
+        self.assertEqual(self.store.counts(tenant)["journal"], 1)
+
+    def test_the_right_key_removes_every_row_the_tenant_owns(self) -> None:
+        self.app.ops_key = self.OPS
+        tenant, key = self.seed()
+        kept, kept_key = self.store.create_tenant()
+        before = self.store.tenant_count()
+
+        status, body = self.post(tenant, self.OPS)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["deleted"]["kv_sync"], 1)
+        self.assertEqual(body["deleted"]["tenant_keys"], 1)
+        self.assertEqual(body["deleted"]["server_alerts"], 1)
+        self.assertEqual(body["deleted"]["tenants"], 1)
+        self.assertEqual(body["tenants"], before - 1)
+        self.assertIsNone(self.store.tenant_for_key(key))
+        self.assertIsNone(self.store.tenant(tenant))
+        self.assertEqual(self.store.counts(tenant)["journal"], 0)
+        self.assertEqual(self.store.counts(tenant)["alerts"], 0)
+        # The neighbour is untouched: a delete is scoped to one tenant.
+        self.assertEqual(self.store.tenant_for_key(kept_key), kept)
+        self.assertEqual(self.store.tenant_count(), before - 1)
+
+    def test_an_unknown_tenant_is_a_404_after_the_key_checks(self) -> None:
+        self.app.ops_key = self.OPS
+
+        status, body = self.post("t_" + "0" * 16, self.OPS)
+
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "no such tenant")

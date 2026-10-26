@@ -1,15 +1,18 @@
 """HTTP surface: /register, /link, /health, /sync, /events, /a/<fire-id>.
 
-Every request except `/register` (which mints a tenant) and `/a/<fire-id>` (the
-notification's click-through page, which carries no data) is scoped to the
-tenant that owns the presented key. There is no ambient tenant and no shared
+Every request except `/register` (which mints a tenant), `/a/<fire-id>` (the
+notification's click-through page, which carries no data) and the ops-only
+`/ops/tenant/delete` (which presents `OPS_KEY`, not a tenant key) is scoped to
+the tenant that owns the presented key. There is no ambient tenant and no shared
 key: the one key in `config.json` survives only as tenant `main` so that
 already-installed builds keep syncing until they are updated.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -72,6 +75,9 @@ class App:
         self.last_error: str | None = None
         self.register_limiter = RateLimiter(REGISTER_PER_HOUR)
         self.register_window = RateLimiter(REGISTER_HOURLY_CAP)
+        # Unset by default, and the maintenance route does not exist while it is:
+        # an operator door that is always present is a second password to guard.
+        self.ops_key = str(os.environ.get("OPS_KEY") or "").strip()
         self._lock = Lock()
         # Pre-v33 devices still present the old shared key.
         self.store.ensure_legacy_key(str(cfg.get("key") or ""))
@@ -195,6 +201,24 @@ class App:
         key = self.store.issue_key(target, label="linked")
         print(f"linked tenant {tenant} -> {target} (merged {merged})", flush=True)
         return 200, {"tenant": target, "key": key, "merged": merged, "email": email}
+
+    def delete_tenant(self, presented: str, tenant: str) -> tuple[int, dict]:
+        """The one maintenance action the relay exposes.
+
+        It answers 404 when `OPS_KEY` is unset - not 401 - so a deployment
+        without the variable cannot be probed for the route's existence.
+        """
+        if not self.ops_key:
+            return 404, {"error": "not found"}
+        if not hmac.compare_digest(presented, self.ops_key):
+            return 401, {"error": "unauthorised"}
+        if not tenant:
+            return 400, {"error": "tenant required"}
+        if self.store.tenant(tenant) is None:
+            return 404, {"error": "no such tenant"}
+        removed = self.store.delete_tenant(tenant)
+        print(f"ops: deleted tenant {tenant} ({removed})", flush=True)
+        return 200, {"tenant": tenant, "deleted": removed, "tenants": self.store.tenant_count()}
 
 
 def _json_bytes(payload: dict) -> bytes:
@@ -365,6 +389,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/register":
             status, body = self.app.register(self._client_ip())
+            self._json(status, body)
+            return
+
+        if path == "/ops/tenant/delete":
+            # Before the tenant lookup: the caller presents the operator key,
+            # not a tenant key, and the route 404s when OPS_KEY is unset.
+            tenant = payload.get("tenant")
+            status, body = self.app.delete_tenant(
+                self.headers.get("X-Ops-Key", ""),
+                tenant if isinstance(tenant, str) else "",
+            )
             self._json(status, body)
             return
 

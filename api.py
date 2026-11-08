@@ -20,6 +20,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
 
+import rules
+
 VERSION = "2"
 
 # How long one /events call may hold the connection open. Cloudflare keeps a
@@ -100,7 +102,10 @@ class App:
     def health(self, tenant: str) -> dict:
         alerts = self.store.alerts(tenant)
         armed = [a for a in alerts if a.get("armed")]
-        bar_close = [a for a in armed if a.get("cadence") == "barClose"]
+        # Both cadences are evaluated here now. `is_valid` is the same gate the
+        # evaluator applies, so this count cannot promise more than the loop
+        # does (a live `movesBy`, for example, is refused by construction).
+        server_side = [a for a in armed if rules.is_valid(a)]
         counts = self.store.counts(tenant)
         return {
             "ok": True,
@@ -111,8 +116,8 @@ class App:
             "lastSyncMs": self.last_sync_ms,
             "alerts": counts["alerts"],
             "armed": len(armed),
-            "serverSide": len(bar_close),
-            "appOnly": len(armed) - len(bar_close),
+            "serverSide": len(server_side),
+            "appOnly": len(armed) - len(server_side),
             "fires": counts["fires"],
             "journal": counts["journal"],
             "cursors": self.store.cursors(),

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -781,3 +782,79 @@ class OpsDeleteTests(unittest.TestCase):
 
         self.assertEqual(status, 404)
         self.assertEqual(body["error"], "no such tenant")
+
+
+def _dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+
+
+class MarketCalendarTests(unittest.TestCase):
+    def test_week_runs_from_sunday_18_et_to_friday_17_et(self) -> None:
+        self.assertEqual(rules.gold_market_phase_at(_dt(2026, 11, 8, 22, 59)), "weekendClosed")
+        self.assertEqual(rules.gold_market_phase_at(_dt(2026, 11, 8, 23, 0)), "open")
+        self.assertEqual(rules.gold_market_phase_at(_dt(2026, 11, 6, 21, 59)), "open")
+        self.assertEqual(rules.gold_market_phase_at(_dt(2026, 11, 6, 22, 0)), "weekendClosed")
+
+    def test_daily_settlement_hour_is_closed(self) -> None:
+        self.assertEqual(rules.gold_market_phase_at(_dt(2026, 11, 4, 22, 30)), "dailyBreak")
+        self.assertEqual(rules.gold_market_phase_at(_dt(2026, 11, 4, 23, 0)), "open")
+
+    def test_new_york_dst_boundaries(self) -> None:
+        self.assertEqual(rules.new_york_offset_minutes_at(_dt(2026, 3, 8, 6, 59)), -300)
+        self.assertEqual(rules.new_york_offset_minutes_at(_dt(2026, 3, 8, 7, 0)), -240)
+        self.assertEqual(rules.new_york_offset_minutes_at(_dt(2026, 11, 1, 5, 59)), -240)
+        self.assertEqual(rules.new_york_offset_minutes_at(_dt(2026, 11, 1, 6, 0)), -300)
+
+
+class LiveRuleTests(unittest.TestCase):
+    OPEN = int(_dt(2026, 11, 4, 12, 0).timestamp() * 1000)  # Wednesday, 07:00 NY
+    CLOSED = int(_dt(2026, 11, 7, 12, 0).timestamp() * 1000)  # Saturday
+
+    def live_alert(self, **overrides) -> dict:
+        record = alert(cadence="live", operator="crosses", price=4000.0)
+        record.update(overrides)
+        return record
+
+    def test_crossing_needs_a_previous_sample(self) -> None:
+        record = self.live_alert()
+        self.assertFalse(rules.should_fire_live(record, 4001.0, None, self.OPEN))
+        self.assertTrue(rules.should_fire_live(record, 4001.0, 3999.0, self.OPEN))
+        self.assertTrue(rules.should_fire_live(record, 3999.0, 4001.0, self.OPEN))
+
+    def test_threshold_needs_a_full_tick(self) -> None:
+        record = self.live_alert(operator="above")
+        self.assertFalse(rules.should_fire_live(record, 4000.0, 3999.0, self.OPEN))
+        self.assertTrue(rules.should_fire_live(record, 4000.01, None, self.OPEN))
+
+    def test_closed_market_is_silent(self) -> None:
+        record = self.live_alert()
+        self.assertFalse(rules.should_fire_live(record, 4001.0, 3999.0, self.CLOSED))
+
+    def test_expired_and_percent_are_silent(self) -> None:
+        expired = self.live_alert(expiresAt=iso(self.OPEN - 1))
+        self.assertFalse(rules.should_fire_live(expired, 4001.0, 3999.0, self.OPEN))
+        percent = self.live_alert(operator="movesBy", lookback=4)
+        self.assertFalse(rules.should_fire_live(percent, 4001.0, 3999.0, self.OPEN))
+
+
+class LiveStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp(prefix="fxx-live-")
+        self.store = Store(os.path.join(self.dir, "t.db"))
+
+    def tearDown(self) -> None:
+        self.store.close()
+
+    def test_last_price_is_kept_and_cleared_by_a_new_condition(self) -> None:
+        self.store.remember_alert("main", "a1", True, 100)
+        self.store.set_last_price("main", "a1", 4000.0)
+        self.assertEqual(self.store.alert_state("main", "a1")["last_price"], 4000.0)
+        self.store.remember_alert("main", "a1", True, 200)  # new watchingSince
+        self.assertIsNone(self.store.alert_state("main", "a1")["last_price"])
+
+    def test_rearming_clears_the_previous_price(self) -> None:
+        self.store.remember_alert("main", "a1", True, 100)
+        self.store.set_last_price("main", "a1", 4000.0)
+        self.store.remember_alert("main", "a1", False, 100)
+        self.store.remember_alert("main", "a1", True, 100)
+        self.assertIsNone(self.store.alert_state("main", "a1")["last_price"])

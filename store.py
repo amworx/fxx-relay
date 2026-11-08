@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS server_alerts (
   watching_since BIGINT NOT NULL,
   last_fired_ms  BIGINT,
   last_bar_ms    BIGINT,
+  last_price     DOUBLE PRECISION,
   PRIMARY KEY (tenant, id)
 );
 
@@ -207,6 +208,7 @@ class Store:
         with self._lock:
             self._migrate_legacy()
             self._db.executescript(SCHEMA)
+            self._ensure_columns()
 
     def close(self) -> None:
         with self._lock:
@@ -230,6 +232,18 @@ class Store:
             return {row["column_name"] for row in rows}
         rows = self._db.execute(f"PRAGMA table_info({table})").fetchall()
         return {row["name"] for row in rows}
+
+    def _ensure_columns(self) -> None:
+        """Additive columns that `CREATE TABLE IF NOT EXISTS` cannot apply.
+
+        An existing database keeps the table it was built with, so every new
+        column has to be added explicitly. Only nullable additions belong here;
+        anything with a default or a backfill would need a real migration.
+        """
+        if "last_price" not in self._columns("server_alerts"):
+            self._db.execute(
+                "ALTER TABLE server_alerts ADD COLUMN last_price DOUBLE PRECISION"
+            )
 
     def _migrate_legacy(self) -> None:
         """Single-tenant databases (pre-v33) become tenant `main`.
@@ -625,12 +639,18 @@ class Store:
     def alert_state(self, tenant: str, alert_id: str) -> dict:
         with self._lock:
             row = self._db.execute(
-                "SELECT armed, watching_since, last_fired_ms, last_bar_ms"
+                "SELECT armed, watching_since, last_fired_ms, last_bar_ms, last_price"
                 " FROM server_alerts WHERE tenant=? AND id=?",
                 (tenant, alert_id),
             ).fetchone()
         if row is None:
-            return {"armed": None, "watching_since": 0, "last_fired_ms": None, "last_bar_ms": None}
+            return {
+                "armed": None,
+                "watching_since": 0,
+                "last_fired_ms": None,
+                "last_bar_ms": None,
+                "last_price": None,
+            }
         return dict(row)
 
     def remember_alert(self, tenant: str, alert_id: str, armed: bool, watching_ms: int) -> None:
@@ -645,17 +665,20 @@ class Store:
             if row is None:
                 self._db.execute(
                     "INSERT INTO server_alerts"
-                    " (tenant, id, armed, watching_since, last_fired_ms, last_bar_ms)"
-                    " VALUES (?,?,?,?,NULL,NULL)",
+                    " (tenant, id, armed, watching_since, last_fired_ms, last_bar_ms, last_price)"
+                    " VALUES (?,?,?,?,NULL,NULL,NULL)",
                     (tenant, alert_id, armed, watching),
                 )
                 return
-            # A re-arm, or a new condition, makes an earlier fire irrelevant.
+            # A re-arm, or a new condition, makes an earlier fire irrelevant and
+            # the previous price meaningless: a crossing must re-establish its
+            # baseline instead of firing against a sample from the old condition.
             rearmed = row["armed"] == 0 and armed == 1
             rewatched = row["watching_since"] != watching
             if rearmed or rewatched:
                 self._db.execute(
-                    "UPDATE server_alerts SET armed=?, watching_since=?, last_fired_ms=NULL"
+                    "UPDATE server_alerts SET armed=?, watching_since=?,"
+                    " last_fired_ms=NULL, last_price=NULL"
                     " WHERE tenant=? AND id=?",
                     (armed, watching, tenant, alert_id),
                 )
@@ -665,12 +688,28 @@ class Store:
                     (armed, watching, tenant, alert_id),
                 )
 
+    def set_last_price(self, tenant: str, alert_id: str, price: float | None) -> None:
+        """Remember the sample a live crossing will be judged against next tick."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE server_alerts SET last_price=? WHERE tenant=? AND id=?",
+                (price, tenant, alert_id),
+            )
+
     def mark_fired(self, tenant: str, alert_id: str, fired_at_ms: int) -> None:
         with self._lock:
             self._db.execute(
                 "UPDATE server_alerts SET last_fired_ms=?, last_bar_ms=?"
                 " WHERE tenant=? AND id=?",
                 (fired_at_ms, fired_at_ms, tenant, alert_id),
+            )
+
+    def mark_fired_live(self, tenant: str, alert_id: str, fired_at_ms: int) -> None:
+        """A live fire has no bar close instant, so only the fire memory moves."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE server_alerts SET last_fired_ms=? WHERE tenant=? AND id=?",
+                (fired_at_ms, tenant, alert_id),
             )
 
     # --------------------------------------------------------------- misc

@@ -7,12 +7,16 @@ on either side that breaks parity shows up here.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 TICK = 0.01
 PERCENT_EPSILON = 1e-9
 MIN_LOOKBACK = 2
 MAX_LOOKBACK = 100
+
+# A quote is live while its own clock says <= 90s, exactly like
+# `kGoldFreshWindow` in `gold_price.dart`.
+QUOTE_FRESH_MS = 90_000
 
 CROSSING = frozenset({"crosses", "crossesUp", "crossesDown", "entersRange", "exitsRange"})
 RANGE = frozenset({"entersRange", "exitsRange", "insideRange", "outsideRange"})
@@ -195,3 +199,89 @@ def should_fire(
 
     previous = closed[-2]["close"] if len(closed) >= 2 else None
     return matches(alert, bar["close"], previous)
+
+
+# ------------------------------------------------------- gold market calendar
+#
+# Ported from `market_hours.dart` / `display_zone.dart`. The week is defined in
+# New York, not in the viewer's zone, and the DST rule is the same one the app
+# uses for its display clock: EDT from the 2nd Sunday of March 07:00 UTC to the
+# 1st Sunday of November 06:00 UTC. A live quote may only fire while a session
+# is actually running, because a weekend feed that republishes Friday's close
+# would otherwise look fresh and wake someone over a price that cannot move.
+
+NEW_YORK_STANDARD_MINUTES = -5 * 60
+NEW_YORK_DAYLIGHT_MINUTES = -4 * 60
+GOLD_WEEKEND_CLOSE_MINUTE = 17 * 60
+GOLD_WEEK_OPEN_MINUTE = 18 * 60
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _nth_sunday_utc(year: int, month: int, n: int, hour: int) -> datetime:
+    """The UTC instant of the nth Sunday of `month` at `hour`:00 UTC."""
+    first = datetime(year, month, 1, tzinfo=timezone.utc)
+    to_sunday = (6 - first.weekday()) % 7  # weekday(): Monday=0 ... Sunday=6
+    return datetime(year, month, 1 + to_sunday + (n - 1) * 7, hour, tzinfo=timezone.utc)
+
+
+def new_york_offset_minutes_at(utc: datetime) -> int:
+    """New York's offset east of UTC for `utc` — DST-aware."""
+    u = _as_utc(utc)
+    if u.year < 2007:
+        return NEW_YORK_STANDARD_MINUTES
+    start = _nth_sunday_utc(u.year, 3, 2, 7)  # 2nd Sunday of March, 02:00 EST
+    end = _nth_sunday_utc(u.year, 11, 1, 6)  # 1st Sunday of November, 02:00 EDT
+    return NEW_YORK_DAYLIGHT_MINUTES if start <= u < end else NEW_YORK_STANDARD_MINUTES
+
+
+def gold_market_phase_at(utc: datetime) -> str:
+    """`goldMarketPhaseAt`: 'open', 'dailyBreak' or 'weekendClosed'."""
+    u = _as_utc(utc)
+    new_york = u + timedelta(minutes=new_york_offset_minutes_at(u))
+    minute = new_york.hour * 60 + new_york.minute
+    weekday = new_york.weekday()  # Monday=0 ... Sunday=6
+    if weekday == 5:  # Saturday
+        return "weekendClosed"
+    if weekday == 6:  # Sunday
+        return "open" if minute >= GOLD_WEEK_OPEN_MINUTE else "weekendClosed"
+    if weekday == 4:  # Friday
+        return "open" if minute < GOLD_WEEKEND_CLOSE_MINUTE else "weekendClosed"
+    if GOLD_WEEKEND_CLOSE_MINUTE <= minute < GOLD_WEEK_OPEN_MINUTE:
+        return "dailyBreak"
+    return "open"
+
+
+def gold_market_is_open(utc: datetime) -> bool:
+    """True only while a gold session is actually running."""
+    return gold_market_phase_at(utc) == "open"
+
+
+def should_fire_live(
+    alert: dict, price: float | None, previous: float | None, now_ms: int
+) -> bool:
+    """`shouldFire` for a live quote, minus the quote object itself.
+
+    The caller owns freshness (a quote older than [QUOTE_FRESH_MS] must not be
+    used); this function owns the market calendar, the arm/expiry state and the
+    operator test, so a closed market or a paused alert stays silent even when a
+    feed hands us a plausible number. A crossing with no previous sample is
+    silent: the first pass only establishes the baseline, exactly like the app.
+    """
+    if not as_bool(alert.get("armed")):
+        return False
+    expires_at = parse_ms(alert.get("expiresAt"))
+    if expires_at is not None and now_ms >= expires_at:
+        return False
+    # A percent move is a property of a series, not of one quote.
+    if alert.get("operator") == PERCENT:
+        return False
+    if price is None:
+        return False
+    if not gold_market_is_open(datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)):
+        return False
+    return matches(alert, price, previous)

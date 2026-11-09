@@ -20,6 +20,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
 
+import history
 import rules
 
 VERSION = "2"
@@ -36,6 +37,7 @@ MAX_BODY = 4 * 1024 * 1024
 REGISTER_PER_HOUR = 10
 REGISTER_HOURLY_CAP = 200
 TENANT_CAP = 5000
+HISTORY_PER_HOUR = 240
 GOOGLE_TOKENINFO = "https://oauth2.googleapis.com/tokeninfo?id_token="
 
 
@@ -77,6 +79,9 @@ class App:
         self.last_error: str | None = None
         self.register_limiter = RateLimiter(REGISTER_PER_HOUR)
         self.register_window = RateLimiter(REGISTER_HOURLY_CAP)
+        # History is a chart-open call, not a poll: a generous hourly ceiling
+        # that still stops a loop from spending the upstream rate budget.
+        self.history_limiter = RateLimiter(HISTORY_PER_HOUR)
         # Unset by default, and the maintenance route does not exist while it is:
         # an operator door that is always present is a second password to guard.
         self.ops_key = str(os.environ.get("OPS_KEY") or "").strip()
@@ -126,6 +131,9 @@ class App:
             "tenants": self.store.tenant_count(),
             "tunnel": self.tunnel_url(),
             "lastError": self.last_error,
+            # Which second source, if any, can extend a chart's history. Null
+            # means `/history` answers 503 and the app shows what it had.
+            "history": history.SOURCE if history.configured() else None,
         }
 
     def register(self, client_ip: str) -> tuple[int, dict]:
@@ -142,6 +150,39 @@ class App:
             "key": key,
             "now": int(time.time() * 1000),
             "server": {"version": VERSION},
+        }
+
+    def history_bars(
+        self,
+        tenant: str,
+        symbol: str,
+        interval: str,
+        before_ms: int | None,
+        count: int,
+    ) -> tuple[int, dict]:
+        """Older closed bars from the second source, or a refusal.
+
+        Never a partial answer: if the source is unconfigured or fails, the
+        caller gets an error and the app keeps the history it already had. The
+        response names the source so the app can label the seam instead of
+        presenting two brokers' prices as one series.
+        """
+        if not history.configured():
+            return 503, {"error": "history is not configured"}
+        if not self.history_limiter.allow(tenant):
+            return 429, {"error": "too many history requests"}
+        try:
+            bars = history.fetch(symbol, interval, before_ms, count)
+        except ValueError as error:
+            return 400, {"error": str(error)}
+        except history.HistoryError as error:
+            self.note_error(f"history: {error}")
+            return 502, {"error": "history source failed", "detail": str(error)}
+        return 200, {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "source": history.SOURCE,
+            "bars": bars,
         }
 
     def verify_google(self, id_token: str) -> dict | None:
@@ -333,6 +374,24 @@ class Handler(BaseHTTPRequestHandler):
             self._events(tenant)
             return
 
+        if path == "/history":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            symbol = (query.get("symbol") or ["XAUUSD"])[0]
+            interval = (query.get("interval") or ["15m"])[0]
+            try:
+                before = int((query.get("before") or ["0"])[0]) or None
+            except ValueError:
+                before = None
+            try:
+                count = int((query.get("count") or [str(history.DEFAULT_COUNT)])[0])
+            except ValueError:
+                count = history.DEFAULT_COUNT
+            status, body = self.app.history_bars(
+                tenant, symbol, interval, before, count
+            )
+            self._json(status, body)
+            return
+
         if path == "/":
             health = self.app.health(tenant)
             text = (
@@ -342,6 +401,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"server-side {health['serverSide']})\n"
                 f"fires {health['fires']}\n"
                 f"tenants {health['tenants']}\n"
+                f"history {health['history'] or 'off'}\n"
                 f"tunnel {health['tunnel']}\n"
             )
             self._send(200, text.encode("utf-8"), "text/plain; charset=utf-8")

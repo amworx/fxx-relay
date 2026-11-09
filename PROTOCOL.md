@@ -97,12 +97,40 @@ Tenant-scoped:
   "alerts": 1, "armed": 0, "serverSide": 0, "appOnly": 0,
   "fires": 0, "journal": 0, "cursors": { "15m": 1792787400000 },
   "dbKB": 2168, "tenants": 2, "tunnel": "https://itworx.dpdns.org",
-  "lastError": null }
+  "lastError": null, "history": null }
 ```
 
 No auth bypass: health is behind the same key, because the tunnel is public.
 `tenants` is the relay-wide tenant count; everything else describes the caller.
 `lastError` is sticky - it keeps the last feed/push failure until it is cleared.
+`history` names the second source when one is configured (`"oanda"`), and is
+null when `/history` would answer 503.
+
+## GET /history?symbol=XAUUSD&interval=15m&before=<ms>&count=<n>
+
+Older **closed** bars from the second source (OANDA v20, spot `XAU_USD`), for
+the cadences whose live window is too short - 15m holds ~48h. Tenant-scoped,
+Bearer key. `before` is exclusive and defaults to now: the app passes the open
+time of its oldest live bar, so the two series meet without overlapping.
+`count` is clamped to 1..2000 (default 500).
+
+```json
+{ "symbol": "XAUUSD", "interval": "15m", "source": "oanda",
+  "bars": [ { "openTime": "2026-10-28T09:15:00Z", "open": 3980.1, "high": 3984.0,
+              "low": 3978.2, "close": 3983.4, "volume": 0, "tickVolume": 811,
+              "isOpen": false } ] }
+```
+
+Bars are ascending by `openTime` and shaped exactly like an `.../ohlc` payload,
+so the app parses both with one parser. `volume` is always 0 and `tickVolume`
+is OANDA's count of prices - a tick proxy, never consolidated volume. The
+forming candle (`complete: false`) is dropped here, so a caller cannot judge an
+unsettled bar.
+
+Refusals: 503 when `OANDA_TOKEN` is not set, 429 above 240 calls/hour per
+tenant, 502 when OANDA fails (the detail is recorded in `/health`'s
+`lastError`), 400 for an unknown symbol or cadence. There is no partial answer:
+the app either gets the whole page or keeps the history it already had.
 
 ## GET /events?since=<ms>&wait=<sec>
 
